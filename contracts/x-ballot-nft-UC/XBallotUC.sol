@@ -2,14 +2,9 @@
 
 pragma solidity ^0.8.9;
 
-import '../base/CustomChanIbcApp.sol';
+import '../base/UniversalChanIbcApp.sol';
 
-/** 
- * @title XBallot
- * @dev Implements voting process along with vote delegation, 
- * and ability to send cross-chain instruction to mint NFT on counterparty
- */
-contract XBallot is CustomChanIbcApp {
+contract XBallotUC is UniversalChanIbcApp {
     enum IbcPacketStatus {UNSENT, SENT, ACKED, TIMEOUT}
 
     struct Voter {
@@ -19,7 +14,7 @@ contract XBallot is CustomChanIbcApp {
         uint vote;   // index of the voted proposal
         // additional
         IbcPacketStatus ibcPacketStatus;
-        uint[] voteNFTIds;
+        uint[] voteNFTIds;    
     }
 
     struct Proposal {
@@ -41,15 +36,11 @@ contract XBallot is CustomChanIbcApp {
     }
 
     event Voted(address indexed voter, uint proposal);  // Exposing the vote information for debugging; hide in production if you want private voting
-    event SendVoteInfo(bytes32 channelId, address indexed voter, address indexed recipient, uint proposal);
-    event AckNFTMint(bytes32 channelId, uint sequence, address indexed voter, uint voteNFTid);
+    event SendVoteInfo(address indexed destPortAddr, address indexed voter, address indexed recipient, uint proposal);
+    event AckNFTMint(address indexed destPortAddr, address indexed voter, uint voteNFTid);
 
-    /** 
-     * @dev Create a new ballot to choose one of 'proposalNames' and make it IBC enabled to send proof of Vote to counterparty
-     * @param _dispatcher vIBC dispatcher contract
-     * @param proposalNames names of proposals
-     */
-    constructor( IbcDispatcher _dispatcher, bytes32[] memory proposalNames) CustomChanIbcApp(_dispatcher) {
+
+    constructor(address _middleware, bytes32[] memory proposalNames) UniversalChanIbcApp(_middleware) {
         chairperson = msg.sender;
         voters[chairperson].weight = 1;
 
@@ -161,54 +152,70 @@ contract XBallot is CustomChanIbcApp {
         winnerName_ = proposals[winningProposal()].name;
     }
 
-    // IBC methods
-
     /**
      * @dev Sends a packet with a greeting message over a specified channel.
+     * @param destPortAddr The address of the destination application to be used in the port identifier.
      * @param channelId The ID of the channel to send the packet to.
      * @param timeoutSeconds The timeout in seconds (relative).
      * @param voterAddress the address of the voter
      * @param recipient the address on the destination (Base) that will have NFT minted
      */
-    function sendPacket(
-        bytes32 channelId,
+
+    function sendUniversalPacket(
+        address destPortAddr,
+        bytes32 channelId, 
         uint64 timeoutSeconds,
         address voterAddress,
         address recipient
-    ) external {
+        ) external {
         Voter storage voter = voters[voterAddress];
         require(voter.ibcPacketStatus == IbcPacketStatus.UNSENT || voter.ibcPacketStatus == IbcPacketStatus.TIMEOUT, "An IBC packet relating to his vote has already been sent. Wait for acknowledgement.");
 
-        uint proposal = voter.vote;
+        uint propsoal = voter.vote;
         bytes memory payload = abi.encode(voterAddress, recipient);
 
         uint64 timeoutTimestamp = uint64((block.timestamp + timeoutSeconds) * 1000000000);
 
-        dispatcher.sendPacket(channelId, payload, timeoutTimestamp);
+        IbcUniversalPacketSender(mw).sendUniversalPacket(
+            channelId,
+            IbcUtils.toBytes32(destPortAddr),
+            payload,
+            timeoutTimestamp
+        );
         voter.ibcPacketStatus = IbcPacketStatus.SENT;
 
-        emit SendVoteInfo(channelId, voterAddress, recipient, proposal);
+        emit SendVoteInfo(destPortAddr, voterAddress, recipient, propsoal);
     }
 
-    function onRecvPacket(IbcPacket memory) external override view onlyIbcDispatcher returns (AckPacket memory ackPacket) {
+    function onRecvUniversalPacket(
+        bytes32,
+        UniversalPacket calldata
+    ) external override view onlyIbcMw returns (AckPacket memory ackPacket) {
         require(false, "This function should not be called");
 
         return AckPacket(true, abi.encode("Error: This function should not be called"));
     }
 
-    function onAcknowledgementPacket(IbcPacket calldata packet, AckPacket calldata ack) external override onlyIbcDispatcher {
-        ackPackets.push(ack);
-        
+    function onUniversalAcknowledgement(
+            bytes32 channelId,
+            UniversalPacket memory packet,
+            AckPacket calldata ack
+    ) external override onlyIbcMw {
+        ackPackets.push(UcAckWithChannel(channelId, packet, ack));
+
         // decode the ack data, find the address of the voter the packet belongs to and set ibcNFTMinted true
         (address voterAddress, uint256 voteNFTid) = abi.decode(ack.data, (address, uint256));
         voters[voterAddress].ibcPacketStatus = IbcPacketStatus.ACKED;
         voters[voterAddress].voteNFTIds.push(voteNFTid);
 
-        emit AckNFTMint(packet.src.channelId, packet.sequence, voterAddress, voteNFTid);
+        emit AckNFTMint(IbcUtils.toAddress(packet.destPortAddr), voterAddress, voteNFTid);
     }
 
-    function onTimeoutPacket(IbcPacket calldata packet) external override onlyIbcDispatcher {
-        timeoutPackets.push(packet);
-        // do logic
+    function onTimeoutUniversalPacket(
+        bytes32 channelId, 
+        UniversalPacket calldata packet
+    ) external override onlyIbcMw {
+        timeoutPackets.push(UcPacketWithChannel(channelId, packet));
+        // Timeouts not currently supported
     }
 }
